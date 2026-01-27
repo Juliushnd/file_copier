@@ -1,0 +1,10 @@
+[package]
+name = "file_copier"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+walkdir = "2"
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+rayon = "1.8"
