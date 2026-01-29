@@ -1,17 +1,21 @@
 use std::fs;
+use std::num::IntErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 use xxhash_rust::xxh3::xxh3_64;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::io;
-use std::time::Instant;
 use walkdir::WalkDir;
 use std::io::{BufReader, BufWriter};
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use rayon::ThreadPoolBuilder;
+use num_cpus;
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::time::{Instant, Duration};
+use std::thread;
+
 
 
 
@@ -46,10 +50,24 @@ fn dir_size(path: &Path) -> u64 {
         .sum()
 }
 
-fn compare_directories(source: &Path, dest: &Path, checksum: bool) -> Result<Vec<FileAction>, std::io::Error> {
+fn count_files(path: &Path) -> u64 {
+    WalkDir::new(path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .count() as u64
+}
+
+
+
+fn compare_directories(source: &Path, dest: &Path, checksum: bool, measure_size: u8) -> Result<Vec<FileAction>, std::io::Error> {
 
     let start = Instant::now();
-    let size = dir_size(source);
+    let mut total_count = match measure_size{
+        1 => count_files(source),
+        2 => dir_size(source),
+        _ => 1
+    };
     println!("Zeit: {:.2?}", start.elapsed());
 
 
@@ -81,33 +99,45 @@ fn compare_directories(source: &Path, dest: &Path, checksum: bool) -> Result<Vec
                     if meta_dest.len() != meta_src.len() {
                         let fa = FileAction {source_path:src_path, dest_path: dest_path, size: meta_src.len(), reason: CopyReason::SizeDiffers,};
                         file_actions.push(fa);
+
                     }
                     else if meta_dest.modified().ok() != meta_src.modified().ok() {
                         let fa = FileAction {source_path:src_path, dest_path: dest_path, size: meta_src.len(), reason: CopyReason::Modified,};
                         file_actions.push(fa);
+
                     }
                     else if checksum && file_checksum(&src_path)? != file_checksum(&dest_path)? {
                         let fa = FileAction {source_path:src_path, dest_path: dest_path, size: meta_src.len(), reason: CopyReason::Modified,};
                         file_actions.push(fa);
                     }
+                    
                 }
                 else {
                   
-                    let fa = FileAction {source_path:src_path, dest_path: dest_path, size: meta_src.len(), reason: CopyReason::NewFile,};
+                    let fa = FileAction {source_path:src_path, dest_path: dest_path.clone(), size: meta_src.len(), reason: CopyReason::NewFile,};
                     file_actions.push(fa);
                 }
 
                 scanned_bytes += meta_src.len();
                 count +=1;
                 if count % 1000 == 0 {
-                    print!("\rScanning Progress: {}%", (scanned_bytes * 100 / size));
+                    match measure_size{
+                        1 => print!("\rScanning Progress: {}%", (count * 100 / total_count)),
+                        2 => print!("\rScanning Progress: {}%", (scanned_bytes * 100 / total_count)),
+                        _ => print!("\rScanning Progress: {} , {} files", format_bytes(scanned_bytes), count),
+                    };
                     io::stdout().flush().ok();
                 }
             }
         }
     }
+    total_count = count;
 
-    println!("\rScanning Progress: {}%", (scanned_bytes * 100 / size));
+   match measure_size{
+        1 => print!("\rScanning Progress: {}%", (count * 100 / total_count)),
+        2 => print!("\rScanning Progress: {}%", (scanned_bytes * 100 / total_count)),
+        _ => print!("\rScanning Progress: {} bytes, {} files", format_bytes(scanned_bytes), count),
+    };
     println!("Zeit: {:.2?}", start.elapsed());
 
     return Ok(file_actions);
@@ -279,13 +309,13 @@ fn copy_files(file_actions: &Vec<FileAction>) -> std::io::Result<u64> {
         
         // print progress
         if copied_files % one_percent_files == 0 || copied_bytes % one_percent_bytes == 0{ 
-            let _ = print_progress(copied_bytes, total_bytes, copied_files, total_files, speed); 
+            let _ = print_progress(copied_bytes, total_bytes, copied_files, total_files, speed, 0.0); 
         }
 
         copied_files +=1;
     }
 
-    if total_bytes > 0 {let _ = print_progress(copied_bytes, total_bytes, copied_files, total_files, 0.0); }
+    if total_bytes > 0 {let _ = print_progress(copied_bytes, total_bytes, copied_files, total_files, 0.0, 0.0); }
 
     return Ok(copied_bytes);
    
@@ -293,11 +323,11 @@ fn copy_files(file_actions: &Vec<FileAction>) -> std::io::Result<u64> {
 
 
 fn copy_files_parallel(file_actions: &Vec<FileAction>) -> std::io::Result<u64> {
-    //let file_actions = compare_directories(src, dest, false)?;
 
     // find total size and number of files
     println!("{} Dateien zu kopieren", file_actions.len());
     let total_bytes: u64 = file_actions.iter().map(|a| a.size).sum();
+    
 
     match total_bytes {
         ..1_000_000_000 => println!("Gesamtgröße: {} MB", total_bytes / 1_000_000),
@@ -306,9 +336,53 @@ fn copy_files_parallel(file_actions: &Vec<FileAction>) -> std::io::Result<u64> {
 
     let copied_bytes = Arc::new(AtomicU64::new(0));
     let copied_files = Arc::new(AtomicU64::new(0));
-    let total_files = file_actions.len();
-    
+    let total_files = file_actions.len() as u64;
+    let done = Arc::new(AtomicBool::new(false));
+
+
+    // start Progress-Thread
+    let progress_handle = {
+        let copied_bytes = Arc::clone(&copied_bytes);
+        let copied_files = Arc::clone(&copied_files);
+        let done = Arc::clone(&done);
+
+        thread::spawn(move || {
+            let mut last_bytes: u64 = 0;
+            let mut last_time = Instant::now();
+            let total_time = Instant::now();
+
+            while !done.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(1000));
+
+                let bytes = copied_bytes.load(Ordering::Relaxed);
+                let files = copied_files.load(Ordering::Relaxed);
+
+                let diff = last_time.elapsed().as_secs_f32();
+                let speed = if diff > 0.0 {
+                    (bytes - last_bytes) as f32 / diff
+                } else {
+                    0.0
+                };
+
+                print_progress(bytes, total_bytes, files, total_files, speed, total_time.elapsed().as_secs_f32());
+
+                last_bytes = bytes;
+                last_time = Instant::now();
+            }
+
+            // Finale Ausgabe
+            let bytes = copied_bytes.load(Ordering::Relaxed);
+            let files = copied_files.load(Ordering::Relaxed);
+            print_progress(bytes, total_bytes, files, total_files, 0.0, 0.0);
+            println!();
+        })
+    };
+
+
     file_actions.par_iter().for_each(|file| {
+        //let needs_confirmation = matches!(file.reason, CopyReason::SizeDiffers | CopyReason::Modified);
+        //if needs_confirmation && !ask_user(&format!("Overwrite \"{}\"?", file.dest_path.display())) {continue;}
+
         if let Some(parent) = file.dest_path.parent() {
             fs::create_dir_all(parent).ok();
         }
@@ -317,42 +391,32 @@ fn copy_files_parallel(file_actions: &Vec<FileAction>) -> std::io::Result<u64> {
             copied_bytes.fetch_add(size, Ordering::Relaxed);
             let files = copied_files.fetch_add(1, Ordering::Relaxed) + 1;
             
-            // Progress alle 100 Dateien
-            if files % 100 == 0 {
-                let bytes = copied_bytes.load(Ordering::Relaxed);
-                let percent = (bytes * 100) / total_bytes;
-                print!("\r{}% - {} / {} files", percent, files, total_files);
-                std::io::stdout().flush().ok();
-            }
         }
     });
 
-    println!("\nFertig!");
+
+   // kill Progress-Thread
+    done.store(true, Ordering::Relaxed);
+    progress_handle.join().ok();
+
     Ok(copied_bytes.load(Ordering::Relaxed))
 }
 
-fn print_progress(copied_bytes: u64, total_bytes: u64, count : u64, total_file: u64, speed: f32) -> Result<(), Box<dyn std::error::Error>>{
+fn print_progress(copied_bytes: u64, total_bytes: u64, count : u64, total_file: u64, speed: f32, elapsed_time: f32) -> Result<(), Box<dyn std::error::Error>>{
 
     let percent:u64 = match total_bytes{
-        0 => 0,
+        0 => 100,
         _ => (copied_bytes * 100) / total_bytes,
     };
 
-    let (copied_str, total_str) = if total_bytes >= 1_000_000_000 {
-            (
-                format!("{:.1} GB", copied_bytes as f64 / 1_000_000_000.0),
-                format!("{:.1} GB", total_bytes as f64 / 1_000_000_000.0),
-            )
-    } else {
-            (
-                format!("{} MB", copied_bytes / 1_000_000),
-                format!("{} MB", total_bytes / 1_000_000),
-            )
-    };
+    let copied_str = format_bytes(copied_bytes);
+    let total_str = format_bytes(total_bytes);
 
     let speed_str = format_speed(speed);
+    let remaining_time = (total_bytes - copied_bytes) as f32 / (copied_bytes as f32 / elapsed_time); 
+    let remaining_time_str = format_time(remaining_time);
 
-    print!("\r{:>3}% - {} / {} - {} / {} Files - Current Speed: {}", percent, copied_str, total_str, count, total_file, speed_str );
+    print!("\r{:>3}% - {} / {} - {} / {} Files - Current Speed: {} - Elapsed Time: {} - Expected remaining time: {}", percent, copied_str, total_str, count, total_file, speed_str ,elapsed_time, remaining_time_str);
     io::stdout().flush()?;
     Ok(())
 }
@@ -363,6 +427,32 @@ fn format_speed(bytes_per_sec: f32) -> String {
         s if s >= 1_000_000.0 => format!("{:.2} MB/s", s / 1_000_000.0),
         s if s >= 1_000.0 => format!("{:.2} KB/s", s / 1_000.0),
         s => format!("{:.0} B/s", s),
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    match bytes {
+        ..1_000_000 => format!("{} KB", bytes / 1_000),
+        ..1_000_000_000 => format!("{} MB", bytes / 1_000_000),
+        _ => format!("{:.1} GB", bytes as f64 / 1_000_000_000.0),
+    }
+}
+
+fn format_time(secs: f32) -> String {
+    if secs < 60.0 {
+        format!("{:.1}s", secs)
+    } else if secs < 3600.0 {
+        let mins = (secs / 60.0) as u32;
+        let secs = secs % 60.0;
+        format!("{}m", mins)
+    }
+    else if secs > 864400.0 {
+        format!("More than a day")
+    }
+    else {
+        let hours = (secs / 3600.0) as u32;
+        let mins = ((secs % 3600.0) / 60.0) as u32;
+        format!("{}h {}m", hours, mins)
     }
 }
 
@@ -389,68 +479,75 @@ fn ask_user(question : &str) -> bool{
 }
 
 // TO DO:
-// Estimated time, compression
+// Estimated time, flags
 
 fn main() {
 
-    ThreadPoolBuilder::new()
-    .num_threads(8)
-    .build_global()
-    .unwrap();
-
+   
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut num_threads: usize = 0;
+    let physical_cores = num_cpus::get_physical();
 
-    let dest = PathBuf::from(args.last().unwrap());
-    let sources: Vec<PathBuf> = args[..args.len()-1]
+    let mut cheksum : bool = false;
+    let mut measure_size = 0;
+
+
+    let flags: Vec<&String> = args
+        .iter()
+        .filter(|arg| arg.starts_with("--"))
+        .collect();
+
+
+    for flag in flags {
+        let clean = flag.strip_prefix("--").unwrap_or(flag);
+
+        match clean {
+            "cs" => cheksum = true,
+            "countBytes" => measure_size = 2,
+            "countFiles" => measure_size = 1,
+            x => num_threads = x.parse().unwrap(),
+        };
+    }
+
+    let paths: Vec<&String> = args
+        .iter()
+        .filter(|arg| !arg.starts_with("--"))
+        .collect();
+
+    let dest = PathBuf::from(paths.last().unwrap());
+
+    let sources: Vec<PathBuf> = paths[..paths.len()-1]
         .iter()
         .map(PathBuf::from)
         .collect();
 
-    let mut cheksum : bool = false;
-
-    let test = false;
     
-    if !test {
-        /*println!("Src path: ");
-        io::stdin()
-        .read_line(&mut src)
-        .expect("Failed to read line");
+    if num_threads == 0 { num_threads = physical_cores;}
 
-        println!("Dest path: ");
-        io::stdin()
-        .read_line(&mut dest)
-        .expect("Failed to read line");
+
+    ThreadPoolBuilder::new()
+    .num_threads(num_threads)
+    .build_global()
+    .unwrap();
+
+
+    println!("{}", num_threads);
     
-        println!("Use Checksum: ");
-        io::stdin()
-        .read_line(&mut cheksum)
-        .expect("Failed to read line");
-        */
-
-        let args: Vec<String> = std::env::args().skip(1).collect();
-
-        let dest = PathBuf::from(args.last().unwrap());
-        let sources: Vec<PathBuf> = args[..args.len()-1]
-            .iter()
-            .map(PathBuf::from)
-            .collect();
-
-    } 
-    
-    test_fnc(&sources, &dest);
+    test_fnc(&sources, &dest, measure_size);
     
 } 
 
-fn test_fnc(sources: &Vec<PathBuf> , dest: &PathBuf)  -> Result<(), Box<dyn std::error::Error>>{
-    println!("{:?}, {:?}",dest, sources);
+fn test_fnc(sources: &Vec<PathBuf> , dest: &PathBuf, measure_size: u8)  -> Result<(), Box<dyn std::error::Error>>{
 
     let start = Instant::now();
     let mut all_file_actions = Vec::<FileAction>::new();
+
     for src in sources {
         let dest_path = dest.join(&src.file_name().unwrap());
         
-        let mut acttions = compare_directories(&src, &dest_path, false)?;
-        all_file_actions.append(&mut acttions);
+        let mut actions = compare_directories(&src, &dest_path, false, measure_size)?;
+       
+        all_file_actions.append(&mut actions);
         
     }
 
@@ -458,7 +555,7 @@ fn test_fnc(sources: &Vec<PathBuf> , dest: &PathBuf)  -> Result<(), Box<dyn std:
         Ok(res) => {
             let time = start.elapsed();
             let bytes_per_second = res as f32 / time.as_secs_f32();
-            println!("Zu kopierende Dateien: {}", format_speed(bytes_per_second));
+            println!("\nAverage download speed: {}", format_speed(bytes_per_second));
             println!("Zeit: {:.2?}", start.elapsed());},
 
         Err(e) => eprintln!("Fehler: {}", e),
