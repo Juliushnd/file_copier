@@ -478,8 +478,6 @@ fn ask_user(question : &str) -> bool{
    
 }
 
-// TO DO:
-// Estimated time, flags
 
 fn main() {
 
